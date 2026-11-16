@@ -13,6 +13,7 @@ import (
 	"github.com/SyncYomi/SyncYomi/internal/database"
 	"github.com/SyncYomi/SyncYomi/internal/domain"
 	"github.com/SyncYomi/SyncYomi/internal/logger"
+	"github.com/SyncYomi/SyncYomi/internal/merge"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -275,6 +276,43 @@ func TestMerge_CategoryDeleteAndRefs(t *testing.T) {
 	}
 	if mm := urls(a.Backup)["/m"]; mm != nil && len(mm.Categories) != 0 {
 		t.Errorf("manga still references deleted category: %v", mm.Categories)
+	}
+}
+
+func TestMerge_CategoryTombstoneMarksStoreRow(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+
+	cats := []*pb.BackupCategory{{Name: "Done", Order: 0, Uid: 20, Version: 1}}
+	sync2(t, svc, "A", 0, true, &pb.Backup{BackupCategories: cats})
+	b := sync2(t, svc, "B", 0, true, &pb.Backup{BackupCategories: cats})
+
+	// the deleted-categories header is applied as a KindCategory tombstone
+	b = sync2(t, svc, "B", b.Cursor, false, &pb.Backup{}, 20)
+
+	var row *merge.Item
+	if err := svc.store.ReadTx(ctx, "key1", func(tx domain.SyncStoreReader) error {
+		found, err := tx.GetItems(ctx, merge.KindCategory, []string{"uid:20"})
+		if err != nil {
+			return err
+		}
+		row = found["uid:20"]
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if row == nil || !row.Deleted || row.Seq != b.Cursor || row.OriginDevice != "B" {
+		t.Fatalf("tombstoned category row = %+v (cursor %d)", row, b.Cursor)
+	}
+	now := time.Now().Unix()
+	if row.ModifiedAt <= 0 || row.ModifiedAt > now || row.ModifiedAt < now-60 {
+		t.Errorf("modified_at = %d, want unix seconds near %d", row.ModifiedAt, now)
+	}
+
+	// a fresh device does not receive the deleted category
+	c := sync2(t, svc, "C", 0, true, &pb.Backup{})
+	if len(c.Backup.BackupCategories) != 0 {
+		t.Errorf("render kept the deleted category: %v", c.Backup.BackupCategories)
 	}
 }
 

@@ -543,22 +543,20 @@ func splitBackup(b *pb.Backup) ([]*merge.Item, error) {
 }
 
 func (s *service) mergeBackup(ctx context.Context, tx domain.SyncStoreReader, items []*merge.Item, device string, deletedCategories []int64, deletedChapters []string) (*merge.Result, error) {
-	view, err := loadStoreView(ctx, tx, items, deletedChapters)
+	tombstones := make([]merge.Tombstone, 0, len(deletedCategories)+len(deletedChapters))
+	for _, uid := range deletedCategories {
+		tombstones = append(tombstones, merge.Tombstone{Kind: merge.KindCategory, Key: "uid:" + strconv.FormatInt(uid, 10)})
+	}
+	for _, key := range deletedChapters {
+		tombstones = append(tombstones, merge.Tombstone{Kind: merge.KindChapter, Key: key})
+	}
+
+	view, err := loadStoreView(ctx, tx, items, tombstones)
 	if err != nil {
 		return nil, err
 	}
 
-	deleted := make([]string, 0, len(deletedCategories))
-	for _, uid := range deletedCategories {
-		deleted = append(deleted, "uid:"+strconv.FormatInt(uid, 10))
-	}
-
-	return merge.Merge(view, merge.Request{
-		DeviceID:          device,
-		Items:             items,
-		DeletedCategories: deleted,
-		DeletedChapters:   deletedChapters,
-	}), nil
+	return merge.Merge(view, merge.Request{DeviceID: device, Items: items, Tombstones: tombstones}), nil
 }
 
 // storeView is the merge's window on the server state: the stored items matching the
@@ -568,15 +566,18 @@ type storeView struct {
 	categories []*merge.Item
 }
 
-func loadStoreView(ctx context.Context, tx domain.SyncStoreReader, items []*merge.Item, deletedChapters []string) (*storeView, error) {
+func loadStoreView(ctx context.Context, tx domain.SyncStoreReader, items []*merge.Item, tombstones []merge.Tombstone) (*storeView, error) {
 	keys := map[merge.Kind][]string{}
 	for _, it := range items {
 		if it.Kind != merge.KindCategory {
 			keys[it.Kind] = append(keys[it.Kind], it.Key)
 		}
 	}
-	if len(deletedChapters) > 0 {
-		keys[merge.KindChapter] = append(keys[merge.KindChapter], deletedChapters...)
+	// tombstones must resolve their target row too, so a deletion can flip it
+	for _, tb := range tombstones {
+		if tb.Kind != merge.KindCategory {
+			keys[tb.Kind] = append(keys[tb.Kind], tb.Key)
+		}
 	}
 	view := &storeView{items: map[merge.Kind]map[string]*merge.Item{}}
 	for kind, ks := range keys {
